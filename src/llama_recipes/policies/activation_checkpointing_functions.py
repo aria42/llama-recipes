@@ -23,7 +23,6 @@ def apply_fsdp_checkpointing(model):
     returns None as model is updated directly
     """
     print(f"--> applying fsdp activation checkpointing...")
-
     apply_activation_checkpointing(
         model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
     )
