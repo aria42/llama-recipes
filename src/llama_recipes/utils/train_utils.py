@@ -68,6 +68,16 @@ def profile(cfg, local_rank=None):
         yield None
 
 
+def print_cuda_memory_usage(where: str):
+    print(f"--- {where} ---")
+    torch.cuda.empty_cache()
+    for i in range(torch.cuda.device_count()):
+        device = torch.device(f'cuda:{i}')
+        allocated = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        print(f'Device {i}: Allocated = {allocated}MB, Reserved = {reserved}MB')
+
+
 def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
     """
     Trains the model on the given dataloader
@@ -94,7 +104,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     if train_config.enable_fsdp:
         world_size = int(os.environ["WORLD_SIZE"])
 
-
+    print("scaler: ", scaler)
+    print_cuda_memory_usage("After scaler in train()")
 
     autocast = torch.cuda.amp.autocast if train_config.use_fp16 else nullcontext
     train_prep = []

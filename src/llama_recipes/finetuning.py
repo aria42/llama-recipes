@@ -3,11 +3,17 @@
 
 import os
 
+import accelerate
 import dataclasses
 import fire
 import random
+import safetensors
+import safetensors.torch
 import torch
+import types
+from bitsandbytes.nn import Params4bit
 import torch.optim as optim
+from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from peft import get_peft_model, prepare_model_for_kbit_training
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -18,6 +24,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from torch.optim.lr_scheduler import StepLR
 from transformers import (
     AutoTokenizer,
+    BitsAndBytesConfig,
     LlamaForCausalLM,
     LlamaConfig,
 )
@@ -49,6 +56,18 @@ from llama_recipes.utils.train_utils import (
 )
 from accelerate.utils import is_xpu_available
 
+import torch
+
+def print_cuda_memory_usage(where: str):
+    rank = os.environ["RANK"]
+    print(f"--- rank:{rank}: {where} ---")
+    for i in range(torch.cuda.device_count()):
+        device = torch.device(f'cuda:{i}')
+        allocated = torch.cuda.memory_allocated(device) / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
+        print(f'Device {i}: Allocated = {allocated}MB, Reserved = {reserved}MB')
+
+
 def setup_wandb(train_config, fsdp_config, **kwargs):
     try:
         import wandb
@@ -66,6 +85,38 @@ def setup_wandb(train_config, fsdp_config, **kwargs):
     run.config.update(fsdp_config, allow_val_change=True)
     return run
 
+def get_safetensors(model_name) -> list[tuple[str, torch.Tensor]]:
+    try:
+        idx = hub.cached_file(model_name, SAFE_WEIGHTS_INDEX_NAME)
+        files, _ = hub.get_checkpoint_shard_files(model_name, idx)
+    except OSError:
+        try:
+            # This means the model doesn't have a model.safetensors.index.json because it is not sharded
+            files: list[str] = []
+            files.append(hub.cached_file(model_name, SAFE_WEIGHTS_NAME))            
+        except OSError as e:
+            # This means the model probably doesn't have a safetensors file
+            raise e
+    return [(name, weights) for filename in files for (name, weights) in safetensors.torch.load_file(filename).items()]    
+
+class DummyQuantMove:
+    def __init__(self, model) -> None:
+        self.model = model
+    
+    def __enter__(self):
+        def temp_to_method(self, *args, **kwargs):
+            return self
+        for param in self.model.parameters():
+            if isinstance(param, Params4bit):
+                param.quant_state._orig_to = param.quant_state.to
+                param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for param in self.model.parameters():
+            if isinstance(param, Params4bit) and hasattr(param.quant_state, '_orig_to'):
+                param.quant_state.to = param.quant_state._orig_to
+                param.quant_state._orig_to = None
+    
 
 def main(**kwargs):
     # Update the configuration for the training and sharding process
@@ -97,6 +148,15 @@ def main(**kwargs):
     if train_config.use_wandb:
         if not train_config.enable_fsdp or rank==0:
             wandb_run = setup_wandb(train_config, fsdp_config, **kwargs)
+            
+    # quantization
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_storage=torch.float16,
+    ) if train_config.quantization else None
 
     # Load the pre-trained model and setup its configuration
     use_cache = False if train_config.enable_fsdp else None
@@ -107,25 +167,26 @@ def main(**kwargs):
         model alone would consume 2+TB cpu mem (70 * 4 * 8). This will add some comms
         overhead and currently requires latest nightly.
         """
-        if rank == 0:
+        if rank == 0 and not train_config.peft_method:            
             model = LlamaForCausalLM.from_pretrained(
                 train_config.model_name,
-                load_in_8bit=True if train_config.quantization else None,
-                device_map="auto" if train_config.quantization else None,
+                # load_in_8bit=True if train_config.quantization else None,
+                quantization_config=bnb_config,
+                device_map="auto" if train_config.quantization and not train_config.enable_fsdp else None,
                 use_cache=use_cache,
                 attn_implementation="sdpa" if train_config.use_fast_kernels else None,
             )
         else:
             llama_config = LlamaConfig.from_pretrained(train_config.model_name)
             llama_config.use_cache = use_cache
-            with torch.device("meta"):
+            with accelerate.init_empty_weights():
                 model = LlamaForCausalLM(llama_config)
 
     else:
         model = LlamaForCausalLM.from_pretrained(
             train_config.model_name,
             load_in_8bit=True if train_config.quantization else None,
-            device_map="auto" if train_config.quantization else None,
+            # device_map="auto" if train_config.quantization else None,
             use_cache=use_cache,
             attn_implementation="sdpa" if train_config.use_fast_kernels else None,
         )
@@ -143,16 +204,36 @@ def main(**kwargs):
     print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
 
     # Prepare the model for int8 training if quantization is enabled
-    if train_config.quantization:
-        model = prepare_model_for_kbit_training(model)
+    # if train_config.quantization and not train_config.enable_fsdp:
+    #     model = prepare_model_for_kbit_training(model)
 
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
-    if train_config.enable_fsdp and fsdp_config.pure_bf16:
-        model.to(torch.bfloat16)
+    # if train_config.enable_fsdp and fsdp_config.pure_bf16:
+    #     model.to(torch.bfloat16)
+        
+    # qlora 
+    if train_config.peft_method == "lora" and train_config.use_peft and train_config.enable_fsdp:
+        # HACK
+        dtype = torch.float16
+        final_device = ("cpu" if train_config.low_cpu_fsdp else "cuda:0") if rank == 0 else "meta"
+        for name, value in get_safetensors(train_config.model_name):
+            module_key, _, value_key = name.rpartition('.')                
+            submodule = model.get_submodule(module_key)
+            try:                
+                param = submodule.get_parameter(value_key)
+                if isinstance(param, Params4bit):
+                    value = type(param)(value.to(device=local_rank, dtype=dtype).data, **param.__dict__).cuda(local_rank)
+                value = type(param)(value.data.to(final_device), **value.__dict__)                
+            except AttributeError:
+                value = value.to(device=final_device, dtype=dtype)
+            setattr(submodule, value_key, value)
+                
+
 
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
-        model = get_peft_model(model, peft_config)
+        with DummyQuantMove(model):
+            model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
         if wandb_run:
             wandb_run.config.update(peft_config)
@@ -172,12 +253,13 @@ def main(**kwargs):
         mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
         my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
 
+        print(f"Mixed precision: {mixed_precision_policy}")
         device_id = 0
         if is_xpu_available():
             device_id = torch.xpu.current_device()
         elif torch.cuda.is_available():
             device_id = torch.cuda.current_device()
-
+        print_cuda_memory_usage("Befure FSDP")
         model = FSDP(
             model,
             auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
@@ -191,8 +273,10 @@ def main(**kwargs):
             param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
             if train_config.low_cpu_fsdp and rank != 0 else None,
         )
+        print_cuda_memory_usage("After FSDP")
         if fsdp_config.fsdp_activation_checkpointing:
             apply_fsdp_checkpointing(model)
+            print_cuda_memory_usage("Ater checkpoint activation")
     elif not train_config.quantization and not train_config.enable_fsdp:
         if is_xpu_available():
             model.to("xpu:0")
@@ -207,7 +291,7 @@ def main(**kwargs):
         dataset_config,
         split="train",
     )
-
+    print_cuda_memory_usage("After dataset_train")
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
 
@@ -263,7 +347,7 @@ def main(**kwargs):
             weight_decay=train_config.weight_decay,
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
-
+    print_cuda_memory_usage("After optimizer")
     # Start the training process
     results = train(
         model,
